@@ -49,6 +49,9 @@ docker compose up --build
 
 服务在 <http://localhost:8000> 启动，交互式文档：<http://localhost:8000/docs>。
 SQLite 数据文件保存在命名卷 `bidi-audit-data`（容器内 `/data/audit.db`）。
+多记录审计接口（`POST /api/v1/audits/diff`、`POST /api/v1/audits/json`）把一次请求的
+全部记录放在**同一个 SQLite 事务**中写入：任一记录写入失败即整批回滚，调用方不会
+看到部分新增记录；空结果不产生记录。
 启动方式无需改动，新增的 `POST /api/v1/audits/diff`、`POST /api/v1/audits/json`、
 `POST /api/v1/audits/csv`、`POST /api/v1/audits/gate`、
 `POST /api/v1/identifiers/normalization`、
@@ -182,6 +185,9 @@ No-newline 标记只参与结构解析，不参与分析。
 成功后为每个含新增内容的文件**各保存一条审计记录**（`filename` 为新文件路径，
 重建的新增文本存入 `raw_text`，映射信息存入记录的 `meta` 字段，可通过
 `GET /api/v1/audits/{id}` 取回），返回各记录 ID 与跨文件汇总的最高风险。
+整份 diff 解析完成后，本次全部记录在**同一个 SQLite 事务**中写入：任一记录
+写入失败即整批回滚，调用方不会看到部分新增记录；响应中的记录 ID 按文件在
+diff 中的出现顺序回填。
 
 ```bash
 cat > evil.diff <<'PATCH'
@@ -345,14 +351,17 @@ jq -Rs '{diff: .}' cafe.diff | \
 ```
 
 校验在任何写入之前完成：解析或 hunk 计数失败时**不写入任何记录**（多文件 diff 中
-后置文件出错，前面的文件同样不会落库）。
+后置文件出错，前面的文件同样不会落库）；通过校验后所有记录也在**同一事务**中
+落库，任一写入失败即整批回滚。
 
 ### `POST /api/v1/audits/json` — JSON 文档字符串值审计
 
 接收一段**原始 JSON 文档文本**（`document` 字段），用严格遵循
 [RFC 8259](https://datatracker.ietf.org/doc/html/rfc8259) 的解析器递归遍历对象与
 数组，对其中每一个**字符串值**运行 bidi 解析（**对象的键只参与解析，绝不审计**），
-并为每个字符串值**各保存一条审计记录**。
+并为每个字符串值**各保存一条审计记录**。整份文档解析完成后，本次全部记录在
+**同一个 SQLite 事务**中写入：任一记录写入失败即整批回滚，调用方不会看到部分
+新增记录；响应中的记录 ID 按值在文档中的出现顺序回填。
 
 每个字符串值返回：
 
@@ -419,8 +428,9 @@ curl -s -X POST http://localhost:8000/api/v1/audits/json \
   一致），列 1 起始。
 - 嵌套深度上限为 256 层，超出按非法文档处理。
 
-错误情况（均返回 `422` 且**不写入任何记录**——整个文档先解析校验通过后才逐值落库，
-重复键出现在文档末尾时前面的值同样不会落库）：
+错误情况（均返回 `422` 且**不写入任何记录**——整个文档先解析校验通过后才批量落库，
+重复键出现在文档末尾时前面的值同样不会落库；落库本身也是单事务，任一记录写入
+失败即整批回滚）：
 
 | `detail.error` | 条件 |
 |---|---|
@@ -1305,7 +1315,7 @@ curl -s -X POST http://localhost:8000/api/v1/audits/gate \
 │   ├── gate.py        # 路径风险门禁（分段模板匹配 * / **、规则优先级、阈值判定）
 │   ├── verify.py      # 重算校验：从原文重新解析并与存储结果逐字段 diff
 │   ├── sarif.py       # 已存审计 -> SARIF 2.1.0（rule/result、UTF-16 列、diff 记录回映射新文件行号、指纹）
-│   ├── database.py    # SQLite schema / CRUD / 查询（含可选 meta_json）
+│   ├── database.py    # SQLite schema / CRUD / 查询（含可选 meta_json；多记录批量写入走同一事务，失败整体回滚）
 │   ├── schemas.py     # Pydantic 请求模型
 │   ├── main.py        # FastAPI 路由
 │   └── init_db.py     # 独立初始化入口（容器启动调用）
@@ -1314,6 +1324,7 @@ curl -s -X POST http://localhost:8000/api/v1/audits/gate \
 │   ├── test_bidi.py   # 解析器单元测试 + API 冒烟测试
 │   ├── test_diff_audit.py # unified diff 审计（解析/回映射/422/落库）
 │   ├── test_json_audit.py # JSON 文档审计（指针/偏移/转义/代理对/重复键/422）
+│   ├── test_batch_persistence.py # 多记录批量落库（单事务/失败回滚/ID 顺序回填/空批/同表）
 │   ├── test_csv_audit.py # CSV 公式伪装审计（解析/前缀/位置/422/只读）
 │   ├── test_url_query_keys.py # URL 查询键歧义审计（查询串定位/切分/单次解码/NFKC 碰撞/偏移/422/只读）
 │   ├── test_identifiers.py # 标识符 NFKC 碰撞（提取/关键字/码点偏移/BOM/422/独立落库）
@@ -1404,11 +1415,17 @@ CSV 公式伪装审计覆盖逗号分隔/双引号包围/`""` 转义/CRLF 与 LF
 NFKC 碰撞、仅大小写不同不碰撞、碰撞组按首次出现排序、码点起止偏移切片复核、
 参数值从不解码也不参与比较（值中非法编码不报错）、无效百分号编码与无效 UTF-8
 的 422 原 URL 偏移/行列/参数序号（含多行 URL、首个非法键优先、出错时不输出
-部分报告），以及接口只读不落库。
+部分报告），以及接口只读不落库；多记录批量落库覆盖 diff/json 接口的单事务写入
+（任一记录插入失败整批回滚、不留部分记录也不占用 ID）、记录 ID 按原文顺序回填、
+空批次不写库，以及批量记录与单条审计/查询接口共用同一张 `audits` 表。
 
 ## 设计说明
 
 - 审计只做**检测与呈现**，绝不返回"净化后"的文本，避免调用方误以为原文可安全渲染；
   需要人工复核时使用 `escaped_preview`。
 - 控制符使用显式 Unicode 占位符（`⟨RLO⟩`）而非 `‮` 转义，使预览在终端/日志中一眼可见。
+- 多记录审计接口（`POST /api/v1/audits/diff`、`POST /api/v1/audits/json`）在整份输入
+  解析完成后，把本次全部记录放在**同一个 SQLite 事务**中写入：任一记录写入失败即
+  整批回滚，调用方不会看到部分新增记录；空结果（无新增行 / 无字符串值）不产生任何
+  记录。单条审计（`POST /api/v1/audits`）与查询接口与批量记录共用同一张 `audits` 表。
 - SQLite 通过 WAL 友好的单文件方式持久化，位置由环境变量 `BIDI_DB_PATH` 控制。

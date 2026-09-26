@@ -68,14 +68,74 @@ def init_db(db_path: Optional[str] = None) -> None:
 
 @contextmanager
 def connect(db_path: Optional[str] = None) -> Iterator[sqlite3.Connection]:
+    """Open a connection whose statements form a single transaction.
+
+    Leaving the ``with`` block normally commits; any exception rolls
+    everything back before the connection is closed, so a failed batch
+    never leaves partial writes behind.
+    """
     path = db_path or DB_PATH
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
         conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
     finally:
         conn.close()
+
+
+def _insert_audit_row(
+    conn: sqlite3.Connection,
+    *,
+    filename: Optional[str],
+    text: str,
+    result: dict,
+    meta: Optional[dict] = None,
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO audits (created_at, filename, text_length, risk_level,
+                            max_depth, error_count, control_count,
+                            raw_text, result_json, meta_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            time.time(),
+            filename,
+            result["length"],
+            result["risk_level"],
+            result["max_depth"],
+            result["error_count"],
+            result["stats"]["total_control_chars"],
+            text,
+            json.dumps(result, ensure_ascii=False),
+            json.dumps(meta, ensure_ascii=False) if meta is not None else None,
+        ),
+    )
+    return int(cur.lastrowid)
+
+
+def insert_audits(
+    records: list[dict],
+    db_path: Optional[str] = None,
+) -> list[int]:
+    """Insert one batch of audit records in a single SQLite transaction.
+
+    Each item carries the same fields as :func:`insert_audit`
+    (``filename``, ``text``, ``result`` and optional ``meta``).  Every
+    row is written on one connection and committed together: if any
+    insert fails the whole batch is rolled back, so callers never
+    observe partially stored batches.  Returns the new record IDs in
+    input order (for backfilling response items); an empty batch writes
+    nothing and returns an empty list.
+    """
+    if not records:
+        return []
+    with connect(db_path) as conn:
+        return [_insert_audit_row(conn, **record) for record in records]
 
 
 def insert_audit(
@@ -85,28 +145,11 @@ def insert_audit(
     result: dict,
     meta: Optional[dict] = None,
 ) -> int:
-    with connect() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO audits (created_at, filename, text_length, risk_level,
-                                max_depth, error_count, control_count,
-                                raw_text, result_json, meta_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                time.time(),
-                filename,
-                result["length"],
-                result["risk_level"],
-                result["max_depth"],
-                result["error_count"],
-                result["stats"]["total_control_chars"],
-                text,
-                json.dumps(result, ensure_ascii=False),
-                json.dumps(meta, ensure_ascii=False) if meta is not None else None,
-            ),
-        )
-        return int(cur.lastrowid)
+    """Insert a single audit record (a one-item :func:`insert_audits`
+    batch, same table and transaction semantics)."""
+    return insert_audits(
+        [{"filename": filename, "text": text, "result": result, "meta": meta}]
+    )[0]
 
 
 def _row_to_summary(row: sqlite3.Row) -> dict:
