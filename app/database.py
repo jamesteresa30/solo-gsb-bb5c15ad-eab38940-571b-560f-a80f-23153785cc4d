@@ -7,7 +7,7 @@ import os
 import sqlite3
 import time
 from contextlib import contextmanager
-from typing import Iterator, Optional
+from typing import Iterable, Iterator, Optional
 
 DB_PATH = os.environ.get("BIDI_DB_PATH", "/data/audit.db")
 
@@ -68,14 +68,77 @@ def init_db(db_path: Optional[str] = None) -> None:
 
 @contextmanager
 def connect(db_path: Optional[str] = None) -> Iterator[sqlite3.Connection]:
+    """Open a connection whose writes commit as one transaction.
+
+    The transaction commits when the with-body completes; if the body
+    raises, it is rolled back instead, so a failed batch never leaves
+    partially written rows behind.
+    """
     path = db_path or DB_PATH
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
+    except BaseException:
+        conn.rollback()
+        raise
+    else:
         conn.commit()
     finally:
         conn.close()
+
+
+def _insert_audit_row(
+    conn: sqlite3.Connection,
+    *,
+    filename: Optional[str],
+    text: str,
+    result: dict,
+    meta: Optional[dict] = None,
+) -> int:
+    """Insert one audit row on ``conn`` and return its assigned ID."""
+    cur = conn.execute(
+        """
+        INSERT INTO audits (created_at, filename, text_length, risk_level,
+                            max_depth, error_count, control_count,
+                            raw_text, result_json, meta_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            time.time(),
+            filename,
+            result["length"],
+            result["risk_level"],
+            result["max_depth"],
+            result["error_count"],
+            result["stats"]["total_control_chars"],
+            text,
+            json.dumps(result, ensure_ascii=False),
+            json.dumps(meta, ensure_ascii=False) if meta is not None else None,
+        ),
+    )
+    return int(cur.lastrowid)
+
+
+def insert_audits(
+    records: Iterable[dict],
+    *,
+    db_path: Optional[str] = None,
+) -> list[int]:
+    """Persist a batch of audit records in a single SQLite transaction.
+
+    Each record is a dict with the ``filename`` / ``text`` / ``result``
+    (and optional ``meta``) fields of one audit.  Every row is inserted on
+    one connection and committed together: if any insert fails the whole
+    batch is rolled back, so callers never observe partially stored
+    records.  Returns the assigned record IDs backfilled in input order;
+    an empty batch writes nothing and returns an empty list.
+    """
+    items = list(records)
+    if not items:
+        return []
+    with connect(db_path) as conn:
+        return [_insert_audit_row(conn, **item) for item in items]
 
 
 def insert_audit(
@@ -85,28 +148,10 @@ def insert_audit(
     result: dict,
     meta: Optional[dict] = None,
 ) -> int:
-    with connect() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO audits (created_at, filename, text_length, risk_level,
-                                max_depth, error_count, control_count,
-                                raw_text, result_json, meta_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                time.time(),
-                filename,
-                result["length"],
-                result["risk_level"],
-                result["max_depth"],
-                result["error_count"],
-                result["stats"]["total_control_chars"],
-                text,
-                json.dumps(result, ensure_ascii=False),
-                json.dumps(meta, ensure_ascii=False) if meta is not None else None,
-            ),
-        )
-        return int(cur.lastrowid)
+    """Persist one audit record (a single-item atomic batch)."""
+    return insert_audits(
+        [{"filename": filename, "text": text, "result": result, "meta": meta}]
+    )[0]
 
 
 def _row_to_summary(row: sqlite3.Row) -> dict:

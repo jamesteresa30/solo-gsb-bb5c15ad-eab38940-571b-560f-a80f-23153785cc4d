@@ -16,6 +16,7 @@ from .database import (
     get_identifier_report,
     init_db,
     insert_audit,
+    insert_audits,
     insert_identifier_report,
     query_audits,
 )
@@ -160,9 +161,11 @@ def create_diff_audit(payload: DiffAuditRequest) -> dict:
     containing added lines, rebuilds that file's added content in new-file
     order, runs the bidi parser on it and maps each finding back to the
     new-file path/line/column and to the diff line it came from.  One
-    record is persisted per file.  A structurally invalid diff (or a hunk
-    whose body does not match its header counts) yields 422 with the first
-    offending diff line and writes nothing.
+    record is persisted per file; the whole batch is written in a single
+    SQLite transaction, so a failed insert rolls back every record of the
+    request.  A structurally invalid diff (or a hunk whose body does not
+    match its header counts) yields 422 with the first offending diff
+    line and writes nothing.
     """
     try:
         audits = audit_diff(payload.diff)
@@ -176,16 +179,20 @@ def create_diff_audit(payload: DiffAuditRequest) -> dict:
             },
         )
 
-    # Only persist after the entire diff has parsed and audited cleanly,
-    # so a malformed input never writes partial records.
+    # Persist only after the entire diff has parsed and audited cleanly,
+    # and write the batch atomically: a malformed input or a failed
+    # insert never leaves partial records behind.
+    ids = insert_audits(
+        {
+            "filename": audit.new_path,
+            "text": audit.text,
+            "result": audit.result,
+            "meta": audit.meta,
+        }
+        for audit in audits
+    )
     items = []
-    for audit in audits:
-        audit_id = insert_audit(
-            filename=audit.new_path,
-            text=audit.text,
-            result=audit.result,
-            meta=audit.meta,
-        )
+    for audit, audit_id in zip(audits, ids):
         items.append({
             "id": audit_id,
             "stored": True,
@@ -222,8 +229,9 @@ def create_json_audit(payload: JsonAuditRequest) -> dict:
     document, and every control character's decoded position mapped back
     to the original document's line/column (``\\u`` escapes and UTF-16
     surrogate pairs included).  One record is persisted per string
-    value.  Invalid JSON or a duplicate object key yields 422 and writes
-    nothing.
+    value; the whole batch is written in a single SQLite transaction, so
+    a failed insert rolls back every record of the request.  Invalid
+    JSON or a duplicate object key yields 422 and writes nothing.
     """
     try:
         audits = audit_json_document(payload.document)
@@ -254,21 +262,24 @@ def create_json_audit(payload: JsonAuditRequest) -> dict:
             },
         )
 
-    # Only persist after the entire document has parsed and audited
-    # cleanly, so a malformed input never writes partial records.
+    # Persist only after the entire document has parsed and audited
+    # cleanly, and write the batch atomically: a malformed input or a
+    # failed insert never leaves partial records behind.
+    ids = insert_audits(
+        {
+            "filename": (
+                f"{payload.filename}#{audit.pointer}"
+                if payload.filename is not None
+                else f"#{audit.pointer}"
+            ),
+            "text": audit.text,
+            "result": audit.result,
+            "meta": audit.meta,
+        }
+        for audit in audits
+    )
     items = []
-    for audit in audits:
-        filename = (
-            f"{payload.filename}#{audit.pointer}"
-            if payload.filename is not None
-            else f"#{audit.pointer}"
-        )
-        audit_id = insert_audit(
-            filename=filename,
-            text=audit.text,
-            result=audit.result,
-            meta=audit.meta,
-        )
+    for audit, audit_id in zip(audits, ids):
         items.append({
             "id": audit_id,
             "stored": True,

@@ -182,6 +182,9 @@ No-newline 标记只参与结构解析，不参与分析。
 成功后为每个含新增内容的文件**各保存一条审计记录**（`filename` 为新文件路径，
 重建的新增文本存入 `raw_text`，映射信息存入记录的 `meta` 字段，可通过
 `GET /api/v1/audits/{id}` 取回），返回各记录 ID 与跨文件汇总的最高风险。
+整份 diff 的全部记录在**同一个 SQLite 事务**中写入：任一记录写入失败时整批
+回滚，调用方不会看到本次请求的部分新增记录；各记录 ID 按文件在 diff 中的
+顺序回填。
 
 ```bash
 cat > evil.diff <<'PATCH'
@@ -345,7 +348,8 @@ jq -Rs '{diff: .}' cafe.diff | \
 ```
 
 校验在任何写入之前完成：解析或 hunk 计数失败时**不写入任何记录**（多文件 diff 中
-后置文件出错，前面的文件同样不会落库）。
+后置文件出错，前面的文件同样不会落库）。解析通过后的落库也是原子的：本次全部
+记录在单个事务中提交，任一写入失败即整批回滚。
 
 ### `POST /api/v1/audits/json` — JSON 文档字符串值审计
 
@@ -413,14 +417,16 @@ curl -s -X POST http://localhost:8000/api/v1/audits/json \
 - 存入审计表的是**解码后的字符串值**（`raw_text`），因此每条记录同样支持
   `verify` 与 `sarif`；记录的 `filename` 为 `<filename>#<pointer>`（未提供
   `filename` 时为 `#<pointer>`），`meta` 中保存 `pointer` / `span` / `locations`。
+- 本次文档的全部记录在**同一个 SQLite 事务**中写入，记录 ID 按字符串值在文档中
+  的顺序回填；任一记录写入失败时整批回滚，调用方不会看到部分新增记录。
 - 数字、布尔、`null` 不产生记录；文档不含任何字符串值时返回 201、
   `value_count: 0`、`risk_level: "info"`。
 - 行列与偏移均按 **Unicode 码点**计算（与 `/api/v1/audits` 的 `logical_index`
   一致），列 1 起始。
 - 嵌套深度上限为 256 层，超出按非法文档处理。
 
-错误情况（均返回 `422` 且**不写入任何记录**——整个文档先解析校验通过后才逐值落库，
-重复键出现在文档末尾时前面的值同样不会落库）：
+错误情况（均返回 `422` 且**不写入任何记录**——整个文档先解析校验通过后才统一
+落库，重复键出现在文档末尾时前面的值同样不会落库）：
 
 | `detail.error` | 条件 |
 |---|---|
@@ -1305,7 +1311,7 @@ curl -s -X POST http://localhost:8000/api/v1/audits/gate \
 │   ├── gate.py        # 路径风险门禁（分段模板匹配 * / **、规则优先级、阈值判定）
 │   ├── verify.py      # 重算校验：从原文重新解析并与存储结果逐字段 diff
 │   ├── sarif.py       # 已存审计 -> SARIF 2.1.0（rule/result、UTF-16 列、diff 记录回映射新文件行号、指纹）
-│   ├── database.py    # SQLite schema / CRUD / 查询（含可选 meta_json）
+│   ├── database.py    # SQLite schema / CRUD / 查询（含可选 meta_json、单事务批量写入与 ID 回填）
 │   ├── schemas.py     # Pydantic 请求模型
 │   ├── main.py        # FastAPI 路由
 │   └── init_db.py     # 独立初始化入口（容器启动调用）
@@ -1323,7 +1329,8 @@ curl -s -X POST http://localhost:8000/api/v1/audits/gate \
 │   ├── test_gate.py   # 路径风险门禁测试（模板匹配/优先级/默认阈值/只读/404/422）
 │   ├── test_verify.py  # 重算校验接口测试（一致/篡改/缺失 vs null/只读/404）
 │   ├── test_sarif.py  # SARIF 导出测试（level 映射/UTF-16 列/指纹/排序/404）
-│   └── test_sarif_diff.py # diff 记录的 SARIF 导出（新文件真实行号/跨 hunk 区段拆分/UTF-16 列/指纹/meta 回退）
+│   ├── test_sarif_diff.py # diff 记录的 SARIF 导出（新文件真实行号/跨 hunk 区段拆分/UTF-16 列/指纹/meta 回退）
+│   └── test_batch_persist.py # 批量落库（单事务原子性/失败整批回滚/ID 顺序回填/空批/与单条接口同表）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -1370,7 +1377,10 @@ JSON 文档审计覆盖字符串值递归审计（键不审计）、RFC 6901 指
 多行文档行列、根字符串、纯标量零记录、逐值落库与文件名 `#指针` 规则、
 记录 verify/sarif 一致，以及 422 分支（空文档、截断、非法转义、`\u` 非十六进制、
 孤立高/低代理项、字符串内未转义控制字符、数字格式错误、尾随内容、嵌套超深、
-重复键含解码后重复与嵌套重复——均不落库）；路径风险门禁覆盖段内 `*`
+重复键含解码后重复与嵌套重复——均不落库）；批量落库覆盖 diff 与 JSON 两个多记录
+接口的单事务原子写入（任一记录插入失败时整批回滚、调用方看不到部分新增记录）、
+记录 ID 按输入顺序回填、空批不产生记录，以及单条审计接口与批量接口共用同一
+`audits` 表与同一写入封装；路径风险门禁覆盖段内 `*`
 （不跨 `/`，含 `*.py` 扩展名规则）、`**` 零段/一段/多段/连续 `**`/模板中部
 与边界匹配、固定段数优先、同固定段数时总段数优先、仍同分时请求靠前优先、
 未命中与无文件名回退默认阈值、阈值边界包含判定、风险排序与整体结论、
@@ -1412,3 +1422,9 @@ NFKC 碰撞、仅大小写不同不碰撞、碰撞组按首次出现排序、码
   需要人工复核时使用 `escaped_preview`。
 - 控制符使用显式 Unicode 占位符（`⟨RLO⟩`）而非 `‮` 转义，使预览在终端/日志中一眼可见。
 - SQLite 通过 WAL 友好的单文件方式持久化，位置由环境变量 `BIDI_DB_PATH` 控制。
+- 多记录接口（`POST /api/v1/audits/diff`、`POST /api/v1/audits/json`）在整份输入
+  解析完成后，由统一的批量写入封装（`database.insert_audits`）把本次全部记录放在
+  **同一个 SQLite 事务**中落库并按输入顺序回填记录 ID：任一记录写入失败即整批
+  回滚，调用方不会看到部分新增记录；空结果（无新增行 / 无字符串值）不产生记录。
+  单条审计接口复用同一封装（单条即一批一条），所有记录都落在同一张 `audits` 表，
+  查询、详情、verify、SARIF 等接口行为不变。
